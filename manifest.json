@@ -1,17 +1,14 @@
 {
   "manifest_version": 3,
   "name": "X Media Downloader",
-  "version": "1.1.2",
-  "description": "Download X media as MP4/original, or open GIF posts in Snaplytics with the Tweet URL prefilled after a short load delay.",
+  "version": "1.2.0",
+  "description": "Download X media as MP4/original, or open GIF posts in Snaplytics with the post URL filled in.",
   "permissions": [
-    "downloads",
-    "activeTab"
+    "downloads"
   ],
   "host_permissions": [
     "https://x.com/*",
-    "https://twitter.com/*",
-    "https://*.twimg.com/*",
-    "https://t.snaplytics.io/*"
+    "https://twitter.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -53,6 +50,7 @@
         "content.css"
       ],
       "js": [
+        "common.js",
         "content.js"
       ],
       "run_at": "document_start"

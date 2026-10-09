@@ -6,20 +6,13 @@ const countEl = document.getElementById('count');
 const refreshEl = document.getElementById('refresh');
 const downloadAllEl = document.getElementById('downloadAll');
 let currentItems = [];
-let activeTabId = null;
 
-function bestMp4(item) {
-  return (item?.variants || [])
-    .filter(v => /video\/mp4/i.test(v.contentType || '') || /\.mp4(?:\?|$)/i.test(v.url || ''))
-    .sort((a, b) => Number(b.bitrate || 0) - Number(a.bitrate || 0))[0] || null;
-}
-
-function key(item) { return `${item.tweetId || ''}|${item.id || ''}|${item.imageUrl || ''}|${item.variants?.[0]?.url || ''}`; }
+const { bestMp4, mediaKey, isGifCandidate, escapeHtml } = self.XMD;
 
 function unique(items) {
   const map = new Map();
   for (const item of items || []) {
-    const k = key(item);
+    const k = mediaKey(item);
     const prev = map.get(k);
     if (!prev || (!prev.variants?.length && item.variants?.length)) map.set(k, item);
   }
@@ -44,9 +37,11 @@ async function download(item, format, progressEl) {
   try {
     const result = await chrome.runtime.sendMessage({ action: 'xmd-download', item, format });
     if (!result?.ok) throw new Error(result?.error || 'Download failed');
-    if (progressEl) progressEl.textContent = format === 'gif' ? 'Filled in Snaplytics — press Download there.' : 'Sent to Downloads.';
+    if (progressEl) progressEl.textContent = format === 'gif' ? 'Opened Snaplytics — it fills in the post URL; press Download there.' : 'Sent to Downloads.';
+    return true;
   } catch (error) {
     if (progressEl) progressEl.textContent = error?.message || 'Download failed.';
+    return false;
   }
 }
 
@@ -68,6 +63,7 @@ function render(items) {
     card.className = 'media-card';
     const preview = item.previewUrl || item.imageUrl || '';
     const mp4Available = !!bestMp4(item);
+    const gifAvailable = isGifCandidate(item);
     const title = item.tweetId ? `Post ${item.tweetId}` : `Media ${index + 1}`;
 
     card.innerHTML = `
@@ -83,7 +79,7 @@ function render(items) {
           </div>
         </div>
         <div class="actions">
-          <button class="action" data-format="gif">GIF</button>
+          <button class="action" data-format="gif" ${gifAvailable ? '' : 'disabled'}>GIF</button>
           <button class="action" data-format="mp4" ${mp4Available ? '' : 'disabled'}>MP4</button>
           <button class="action primary" data-format="original">Original</button>
         </div>
@@ -98,10 +94,6 @@ function render(items) {
   });
 }
 
-function escapeHtml(value) {
-  return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-}
-
 async function scanPage() {
   statusEl.style.display = 'block';
   statusEl.textContent = 'Scanning the current X page…';
@@ -110,14 +102,12 @@ async function scanPage() {
   downloadAllEl.disabled = true;
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  activeTabId = tab?.id ?? null;
   if (!tab || !/^https:\/\/(x\.com|twitter\.com)\//i.test(tab.url || '')) {
     statusEl.textContent = 'Open x.com or twitter.com to use this extension.';
     return;
   }
 
   try {
-    await chrome.tabs.sendMessage(tab.id, { action: 'xmd-rescan' });
     const response = await chrome.tabs.sendMessage(tab.id, { action: 'xmd-get-page-media' });
     render(response?.items || []);
   } catch (error) {
@@ -127,9 +117,18 @@ async function scanPage() {
 
 refreshEl.addEventListener('click', scanPage);
 downloadAllEl.addEventListener('click', async () => {
-  for (const item of currentItems) {
-    await download(item, 'original', null);
+  const items = [...currentItems];
+  let failed = 0;
+  downloadAllEl.disabled = true;
+  statusEl.style.display = 'block';
+  for (let i = 0; i < items.length; i++) {
+    statusEl.textContent = `Downloading ${i + 1} / ${items.length}…`;
+    if (!(await download(items[i], 'original', null))) failed++;
   }
+  statusEl.textContent = failed
+    ? `Sent ${items.length - failed} of ${items.length} to Downloads — ${failed} failed.`
+    : `Sent all ${items.length} to Downloads.`;
+  downloadAllEl.disabled = false;
 });
 
 scanPage();

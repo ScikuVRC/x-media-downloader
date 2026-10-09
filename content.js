@@ -1,67 +1,104 @@
 (() => {
   'use strict';
 
+  const { isTwimgUrl, isMp4Variant, bestMp4, originalImageUrl, mediaKey, canonicalTweetUrl, isGifCandidate, escapeHtml } = self.XMD;
+
+  const MAX_MEDIA = 1500;
+  const ARTICLE_SELECTOR = 'article[data-testid="tweet"]';
+  const MEDIA_TYPES = new Set(['photo', 'video', 'animated_gif']);
+
+  // key -> item, in insertion order (oldest first) so the cache can be trimmed.
+  const mediaStore = new Map();
+  // tweetId -> Set of keys
   const mediaByTweet = new Map();
-  let allMedia = [];
+  const dirtyTweets = new Set();
   let toastTimer = 0;
 
-  const uniqueKey = (item) => `${item.tweetId || ''}|${item.id || ''}|${item.imageUrl || ''}|${item.variants?.[0]?.url || ''}`;
-
-  const normalizeItem = (item) => ({
-    tweetId: String(item.tweetId || ''),
-    tweetUrl: String(item.tweetUrl || ''),
-    id: String(item.id || ''),
-    type: item.type || 'photo',
-    imageUrl: item.imageUrl || '',
-    previewUrl: item.previewUrl || item.imageUrl || '',
-    width: Number(item.width || 0),
-    height: Number(item.height || 0),
-    durationMs: Number(item.durationMs || 0),
-    variants: Array.isArray(item.variants) ? item.variants.filter(v => v?.url) : []
-  });
-
-  const mergeItems = (items) => {
-    let changed = false;
-    const existing = new Map(allMedia.map(item => [uniqueKey(item), item]));
-    for (const raw of items || []) {
-      const item = normalizeItem(raw);
-      const key = uniqueKey(item);
-      if (!existing.has(key)) {
-        existing.set(key, item);
-        allMedia.push(item);
-        changed = true;
-      } else {
-        const current = existing.get(key);
-        if ((!current.variants?.length && item.variants?.length) || (!current.tweetId && item.tweetId)) {
-          Object.assign(current, item);
-          changed = true;
-        }
-      }
-    }
-    if (changed) rebuildIndex();
+  // Items arrive from the page via postMessage, which any script on x.com can send,
+  // so everything is re-validated here rather than trusted.
+  const normalizeItem = (raw) => {
+    if (!raw || typeof raw !== 'object') return null;
+    const imageUrl = isTwimgUrl(raw.imageUrl) ? String(raw.imageUrl) : '';
+    const previewUrl = isTwimgUrl(raw.previewUrl) ? String(raw.previewUrl) : imageUrl;
+    const variants = (Array.isArray(raw.variants) ? raw.variants : [])
+      .filter(v => v && isTwimgUrl(v.url))
+      .map(v => ({ url: String(v.url), contentType: String(v.contentType || ''), bitrate: Number(v.bitrate || 0) }));
+    if (!imageUrl && !previewUrl && !variants.length) return null;
+    const tweetId = /^\d+$/.test(String(raw.tweetId || '')) ? String(raw.tweetId) : '';
+    return {
+      tweetId,
+      tweetUrl: canonicalTweetUrl(raw.tweetUrl || ''),
+      id: String(raw.id || '').slice(0, 120),
+      type: MEDIA_TYPES.has(raw.type) ? raw.type : 'photo',
+      imageUrl,
+      previewUrl,
+      width: Number(raw.width || 0),
+      height: Number(raw.height || 0),
+      durationMs: Number(raw.durationMs || 0),
+      variants
+    };
   };
 
-  const rebuildIndex = () => {
-    mediaByTweet.clear();
-    for (const item of allMedia) {
-      if (!item.tweetId) continue;
-      if (!mediaByTweet.has(item.tweetId)) mediaByTweet.set(item.tweetId, []);
-      const list = mediaByTweet.get(item.tweetId);
-      if (!list.some(x => uniqueKey(x) === uniqueKey(item))) list.push(item);
+  const indexItem = (key, item) => {
+    if (!item.tweetId) return;
+    if (!mediaByTweet.has(item.tweetId)) mediaByTweet.set(item.tweetId, new Set());
+    mediaByTweet.get(item.tweetId).add(key);
+  };
+
+  const unindexItem = (key, item) => {
+    const keys = mediaByTweet.get(item.tweetId);
+    if (!keys) return;
+    keys.delete(key);
+    if (!keys.size) mediaByTweet.delete(item.tweetId);
+  };
+
+  // API items (with real ids and video variants) win over DOM-scraped ones.
+  const isBetter = (next, current) =>
+    (next.variants.length && !current.variants.length) ||
+    (next.id && !next.id.startsWith('dom-') && current.id.startsWith('dom-'));
+
+  const mergeItems = (rawItems) => {
+    for (const raw of rawItems || []) {
+      const item = normalizeItem(raw);
+      if (!item) continue;
+      const key = mediaKey(item);
+      const current = mediaStore.get(key);
+
+      if (!current) {
+        mediaStore.set(key, item);
+        indexItem(key, item);
+        if (item.tweetId) dirtyTweets.add(item.tweetId);
+        continue;
+      }
+
+      const merged = isBetter(item, current) ? { ...current, ...item } : { ...item, ...current };
+      merged.tweetId = current.tweetId || item.tweetId;
+      merged.tweetUrl = current.tweetUrl || item.tweetUrl;
+      if (merged.tweetId !== current.tweetId || merged.variants.length !== current.variants.length || merged.id !== current.id) {
+        unindexItem(key, current);
+        mediaStore.set(key, merged);
+        indexItem(key, merged);
+        if (merged.tweetId) dirtyTweets.add(merged.tweetId);
+      }
+    }
+
+    while (mediaStore.size > MAX_MEDIA) {
+      const [oldestKey, oldest] = mediaStore.entries().next().value;
+      mediaStore.delete(oldestKey);
+      unindexItem(oldestKey, oldest);
     }
   };
 
   window.addEventListener('message', (event) => {
-    if (event.source !== window || event.data?.source !== 'xmd-main') return;
-    if (event.data.type === 'XMD_MEDIA_BATCH') {
-      mergeItems(event.data.items);
-      scheduleScan();
-    }
+    if (event.source !== window || event.origin !== location.origin) return;
+    if (event.data?.source !== 'xmd-main' || event.data.type !== 'XMD_MEDIA_BATCH') return;
+    if (!Array.isArray(event.data.items)) return;
+    mergeItems(event.data.items);
+    scheduleScan();
   });
 
   const tweetIdFromArticle = (article) => {
-    const links = article.querySelectorAll('a[href*="/status/"]');
-    for (const link of links) {
+    for (const link of article.querySelectorAll('a[href*="/status/"]')) {
       const match = link.getAttribute('href')?.match(/\/status\/(\d+)/);
       if (match) return match[1];
     }
@@ -69,27 +106,13 @@
   };
 
   const tweetUrlFromArticle = (article, tweetId = '') => {
-    const links = article.querySelectorAll('a[href*="/status/"]');
-    for (const link of links) {
-      const href = link.getAttribute('href') || '';
-      const match = href.match(/^(?:https?:\/\/(?:x\.com|twitter\.com))?\/([^/?#]+)\/status\/(\d+)/i);
-      if (!match) continue;
-      if (tweetId && match[2] !== String(tweetId)) continue;
-      return `https://x.com/${match[1]}/status/${match[2]}`;
-    }
-    return tweetId ? `https://x.com/i/status/${tweetId}` : '';
-  };
-
-  const originalImageUrl = (url) => {
-    try {
-      const u = new URL(url);
-      if (u.hostname.endsWith('twimg.com') && /\/media\//.test(u.pathname)) {
-        u.searchParams.set('name', 'orig');
-      }
-      return u.toString();
-    } catch (_) {
+    for (const link of article.querySelectorAll('a[href*="/status/"]')) {
+      const url = canonicalTweetUrl(link.getAttribute('href') || '');
+      if (!url) continue;
+      if (tweetId && !url.endsWith(`/status/${tweetId}`)) continue;
       return url;
     }
+    return tweetId ? `https://x.com/i/status/${tweetId}` : '';
   };
 
   const fallbackMediaFromArticle = (article, tweetId) => {
@@ -104,7 +127,7 @@
       result.push({
         tweetId,
         tweetUrl,
-        id: `dom-${result.length}-${src.split('/').pop()}`,
+        id: `dom-${src.split('/').pop().split('?')[0]}`,
         type: 'photo',
         imageUrl: originalImageUrl(src),
         previewUrl: src,
@@ -136,23 +159,26 @@
 
   const getArticleMedia = (article) => {
     const tweetId = tweetIdFromArticle(article);
-    const cached = tweetId ? (mediaByTweet.get(tweetId) || []) : [];
-    const fallback = fallbackMediaFromArticle(article, tweetId);
-    const map = new Map();
-    [...cached, ...fallback].forEach(item => map.set(uniqueKey(item), item));
     const tweetUrl = tweetUrlFromArticle(article, tweetId);
+    const map = new Map();
+    for (const key of mediaByTweet.get(tweetId) || []) {
+      const item = mediaStore.get(key);
+      if (item) map.set(key, item);
+    }
+    // DOM fallback only fills gaps; it never duplicates or overrides API-captured media.
+    for (const raw of fallbackMediaFromArticle(article, tweetId)) {
+      const item = normalizeItem(raw);
+      if (!item) continue;
+      const key = mediaKey(item);
+      if (!map.has(key)) map.set(key, mediaStore.get(key) || item);
+    }
     return [...map.values()].map(item => ({ ...item, tweetUrl: item.tweetUrl || tweetUrl }));
   };
 
-  const supportsMp4 = (items) => items.some(item => item.variants?.some(v => /video\/mp4/i.test(v.contentType || '') || /\.mp4(?:\?|$)/i.test(v.url)));
-  const supportsGif = (items) => items.length > 0;
-
-  const bestVideo = (item) => {
-    const mp4 = (item.variants || [])
-      .filter(v => /video\/mp4/i.test(v.contentType || '') || /\.mp4(?:\?|$)/i.test(v.url))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    return mp4[0] || null;
-  };
+  const supportsMp4 = (items) => items.some(item => item.variants?.some(isMp4Variant));
+  // X renders both videos and animated GIFs as <video>, so that's enough for Snaplytics
+  // even before the API response with the variants has been captured.
+  const supportsGif = (article, items) => items.some(isGifCandidate) || !!article.querySelector('video');
 
   const showToast = (text) => {
     let el = document.querySelector('.xmd-toast');
@@ -201,7 +227,7 @@
       <div class="xmd-picker-head">
         <div>
           <div class="xmd-picker-title">Choose media</div>
-          <div class="xmd-picker-sub">${items.length} items in this post · ${format.toUpperCase()}</div>
+          <div class="xmd-picker-sub">${items.length} items in this post · ${escapeHtml(format.toUpperCase())}</div>
         </div>
         <button class="xmd-picker-close" aria-label="Close">×</button>
       </div>
@@ -211,17 +237,15 @@
     items.forEach((item, index) => {
       const row = document.createElement('div');
       row.className = 'xmd-picker-item';
-      const canUse = format !== 'mp4' || !!bestVideo(item);
       row.innerHTML = `
-        <img class="xmd-picker-thumb" alt="" src="${escapeAttr(item.previewUrl || item.imageUrl || '')}">
+        <img class="xmd-picker-thumb" alt="" src="${escapeHtml(item.previewUrl || item.imageUrl || '')}">
         <div class="xmd-picker-meta">
           <div class="xmd-picker-type">${escapeHtml(item.type.replace('_', ' '))} ${index + 1}</div>
           <div class="xmd-picker-dim">${item.width && item.height ? `${item.width} × ${item.height}` : 'Best available quality'}</div>
         </div>
-        <button class="xmd-picker-go" ${canUse ? '' : 'disabled'}>${canUse ? (format === 'gif' ? 'Open' : 'Download') : 'N/A'}</button>`;
-      row.querySelector('.xmd-picker-go').addEventListener('click', () => {
-        requestDownload(item, format, row.querySelector('.xmd-picker-go'));
-      });
+        <button class="xmd-picker-go">Download</button>`;
+      const go = row.querySelector('.xmd-picker-go');
+      go.addEventListener('click', () => requestDownload(item, format, go));
       list.appendChild(row);
     });
 
@@ -231,26 +255,36 @@
     document.documentElement.appendChild(backdrop);
   };
 
-  const escapeHtml = (value) => String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const escapeAttr = escapeHtml;
+  const handleGif = (article, items, button) => {
+    const tweetId = tweetIdFromArticle(article);
+    const tweetUrl = tweetUrlFromArticle(article, tweetId);
+    const target = items.find(isGifCandidate)
+      || (article.querySelector('video') && tweetUrl ? { tweetId, tweetUrl, id: '', type: 'video', variants: [] } : null);
+    if (!target) {
+      showToast('This post has no GIF or video to convert');
+      return;
+    }
+    // Snaplytics works from the post URL, so one request covers every GIF/video in the post.
+    requestDownload(target, 'gif', button);
+  };
 
   const handleFormat = (article, format, triggerButton = null) => {
     const items = getArticleMedia(article);
+    if (format === 'gif') {
+      handleGif(article, items, triggerButton);
+      return;
+    }
     if (!items.length) {
       showToast('Media is still loading — scroll the post into view and try again');
       return;
     }
-    if (format === 'gif') {
-      requestDownload(items[0], format, triggerButton);
-      return;
-    }
-    const eligible = format === 'mp4' ? items.filter(bestVideo) : items;
+    const eligible = format === 'mp4' ? items.filter(bestMp4) : items;
     if (!eligible.length) {
       showToast('No MP4 video found in this post');
       return;
     }
     if (eligible.length === 1) requestDownload(eligible[0], format, triggerButton);
-    else openPicker(items, format);
+    else openPicker(eligible, format);
   };
 
   const makeButton = (label, format) => {
@@ -263,16 +297,17 @@
     return button;
   };
 
-  const injectIntoArticle = (article) => {
-    if (article.dataset.xmdInjected === '1') {
-      const wrap = article.querySelector('.xmd-inline-wrap');
-      if (wrap) {
-        const items = getArticleMedia(article);
-        wrap.querySelector('[data-format="mp4"]')?.toggleAttribute('disabled', !supportsMp4(items));
-      }
-      return;
-    }
+  // Buttons stay enabled until media is known, then reflect what the post actually has.
+  const updateButtons = (article) => {
+    const wrap = article.querySelector('.xmd-inline-wrap');
+    if (!wrap) return;
+    const items = getArticleMedia(article);
+    const known = items.length > 0;
+    wrap.querySelector('[data-format="mp4"]')?.toggleAttribute('disabled', known && !supportsMp4(items));
+    wrap.querySelector('[data-format="gif"]')?.toggleAttribute('disabled', known && !supportsGif(article, items));
+  };
 
+  const injectIntoArticle = (article) => {
     const hasMedia = article.querySelector('[data-testid="tweetPhoto"], video, img[src*="pbs.twimg.com/media/"]');
     if (!hasMedia) return;
 
@@ -280,16 +315,9 @@
     const group = reply?.closest('div[role="group"]');
     if (!group) return;
 
-    const items = getArticleMedia(article);
     const wrap = document.createElement('span');
     wrap.className = 'xmd-inline-wrap';
-    const gif = makeButton('GIF', 'gif');
-    const mp4 = makeButton('MP4', 'mp4');
-    const original = makeButton('Original', 'original');
-    mp4.disabled = items.length > 0 && !supportsMp4(items);
-    gif.disabled = items.length > 0 && !supportsGif(items);
-
-    for (const btn of [gif, mp4, original]) {
+    for (const btn of [makeButton('GIF', 'gif'), makeButton('MP4', 'mp4'), makeButton('Original', 'original')]) {
       btn.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -300,12 +328,20 @@
 
     group.appendChild(wrap);
     article.dataset.xmdInjected = '1';
+    article.dataset.xmdTweet = tweetIdFromArticle(article);
+    updateButtons(article);
   };
 
   let scanQueued = false;
   const scan = () => {
     scanQueued = false;
-    document.querySelectorAll('article[data-testid="tweet"]').forEach(injectIntoArticle);
+    // Only articles we haven't handled yet; this runs on every DOM mutation.
+    document.querySelectorAll(`${ARTICLE_SELECTOR}:not([data-xmd-injected])`).forEach(injectIntoArticle);
+    // Refresh button state only for posts whose media changed since the last scan.
+    for (const tweetId of dirtyTweets) {
+      document.querySelectorAll(`${ARTICLE_SELECTOR}[data-xmd-tweet="${tweetId}"]`).forEach(updateButtons);
+    }
+    dirtyTweets.clear();
   };
   const scheduleScan = () => {
     if (scanQueued) return;
@@ -322,23 +358,19 @@
   else document.addEventListener('readystatechange', () => document.documentElement && start(), { once: true });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.action === 'xmd-get-page-media') {
-      document.querySelectorAll('article[data-testid="tweet"]').forEach(article => mergeItems(fallbackMediaFromArticle(article, tweetIdFromArticle(article))));
-      const articles = [...document.querySelectorAll('article[data-testid="tweet"]')];
-      const urlByTweet = new Map(articles.map(article => {
-        const id = tweetIdFromArticle(article);
-        return [id, tweetUrlFromArticle(article, id)];
-      }).filter(([id]) => id));
-      const visibleTweetIds = new Set(urlByTweet.keys());
-      const enrich = (item) => ({ ...item, tweetUrl: urlByTweet.get(item.tweetId) || item.tweetUrl || (item.tweetId ? `https://x.com/i/status/${item.tweetId}` : '') });
-      const visible = allMedia.filter(item => !item.tweetId || visibleTweetIds.has(item.tweetId)).map(enrich);
-      sendResponse({ ok: true, items: visible.length ? visible : allMedia.map(enrich) });
-      return;
+    if (message?.action !== 'xmd-get-page-media') return;
+    scan();
+    const articles = [...document.querySelectorAll(ARTICLE_SELECTOR)];
+    const seen = new Set();
+    const visible = [];
+    for (const article of articles) {
+      for (const item of getArticleMedia(article)) {
+        const key = mediaKey(item);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        visible.push(item);
+      }
     }
-    if (message?.action === 'xmd-rescan') {
-      window.postMessage({ source: 'xmd-isolated', type: 'XMD_RESCAN_DOM_HINT' }, '*');
-      scan();
-      sendResponse({ ok: true });
-    }
+    sendResponse({ ok: true, items: visible });
   });
 })();

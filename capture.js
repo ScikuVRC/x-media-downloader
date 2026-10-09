@@ -21,7 +21,9 @@
       ? entity.video_info.variants.map(normalizeVariant).filter(Boolean)
       : [];
 
-    const id = String(entity.id_str || entity.id || entity.media_key || imageUrl || Math.random());
+    // Skip entities with nothing downloadable; never invent a random id (it defeats de-duplication).
+    if (!imageUrl && !variants.length) return null;
+    const id = String(entity.id_str || entity.id || entity.media_key || '');
     const width = Number(entity.original_info?.width || entity.sizes?.large?.w || 0);
     const height = Number(entity.original_info?.height || entity.sizes?.large?.h || 0);
 
@@ -66,7 +68,7 @@
     }
     if (postedFingerprints.size > MAX_FINGERPRINTS) postedFingerprints.clear();
     if (fresh.length) {
-      window.postMessage({ source: 'xmd-main', type: 'XMD_MEDIA_BATCH', items: fresh }, '*');
+      window.postMessage({ source: 'xmd-main', type: 'XMD_MEDIA_BATCH', items: fresh }, location.origin);
     }
   };
 
@@ -108,7 +110,7 @@
   };
 
   const shouldInspectUrl = (url) => {
-    if (!url) return true;
+    if (!url) return false;
     const text = String(url);
     return /\/graphql\/|\/i\/api\/|Tweet|Timeline|Search|Bookmarks|Likes/i.test(text);
   };
@@ -118,7 +120,9 @@
     window.fetch = async function(...args) {
       const response = await originalFetch.apply(this, args);
       try {
-        const requestUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+        // fetch() accepts a string, a URL object or a Request.
+        const input = args[0];
+        const requestUrl = input instanceof Request ? input.url : String(input ?? '');
         if (shouldInspectUrl(requestUrl)) {
           const contentType = response.headers?.get?.('content-type') || '';
           if (/json/i.test(contentType)) {
@@ -154,12 +158,4 @@
     };
   }
 
-  window.addEventListener('message', (event) => {
-    if (event.source !== window || event.data?.source !== 'xmd-isolated') return;
-    if (event.data.type === 'XMD_RESCAN_DOM_HINT') {
-      // Main-world cache is response driven; this ping exists so future capture strategies
-      // can be added without changing the isolated-world API.
-      window.postMessage({ source: 'xmd-main', type: 'XMD_RESCAN_ACK' }, '*');
-    }
-  });
 })();

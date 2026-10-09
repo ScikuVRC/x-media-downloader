@@ -10,7 +10,7 @@
   const canonicalizeTweetUrl = (value) => {
     try {
       const url = new URL(value);
-      if (!/^(?:x\.com|twitter\.com)$/i.test(url.hostname)) return '';
+      if (!/^(?:www\.)?(?:x\.com|twitter\.com)$/i.test(url.hostname)) return '';
       const status = url.pathname.match(/^\/([^/?#]+)\/status\/(\d+)/i);
       if (!status) return '';
       return `https://x.com/${status[1]}/status/${status[2]}`;
@@ -30,11 +30,19 @@
     input.dispatchEvent(new Event('change', { bubbles: true }));
   };
 
+  const describe = (el) => `${el.placeholder || ''} ${el.name || ''} ${el.id || ''} ${el.getAttribute('aria-label') || ''}`;
+  const isVisible = (el) => !el.disabled && !el.readOnly && el.getClientRects().length > 0;
+
+  // Prefer an input that says it wants a tweet/URL. Only fall back to a generic text
+  // field when it sits in a form with a submit button, and never use a search box.
   const findInput = () => {
-    const inputs = [...document.querySelectorAll('input')];
-    return inputs.find(el => /tweet|twitter|x\.com/i.test(`${el.placeholder || ''} ${el.name || ''} ${el.id || ''}`))
-      || inputs.find(el => el.type === 'url')
-      || inputs.find(el => el.type === 'text');
+    const inputs = [...document.querySelectorAll('input')].filter(isVisible);
+    const notSearch = inputs.filter(el => el.type !== 'search' && !/search/i.test(describe(el)));
+    return notSearch.find(el => /tweet|twitter|x\.com|\burl\b|link/i.test(describe(el)))
+      || notSearch.find(el => el.type === 'url')
+      || notSearch.find(el => el.type === 'text' && el.form?.querySelector('button, [type="submit"]'))
+      // Many sites don't use a real <form>; accept a lone text field as a last resort.
+      || (notSearch.filter(el => el.type === 'text').length === 1 ? notSearch.find(el => el.type === 'text') : undefined);
   };
 
   let attempts = 0;
